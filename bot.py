@@ -1,13 +1,11 @@
 import os
 import logging
+import json
 import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from pyrogram import Client, filters, enums
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from datetime import datetime
-import json
 
 # Configure logging
 logging.basicConfig(
@@ -17,7 +15,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Environment variables
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+API_ID = os.environ.get('API_ID') 
+API_HASH = os.environ.get('API_HASH')
+BOT_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS')
 DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID')
 
@@ -55,243 +55,154 @@ def upload_to_drive(file_path, file_name, mime_type='application/octet-stream'):
             fields='id, name, webViewLink, size'
         ).execute()
         
-        logger.info(f"Uploaded {file_name} to Drive")
         return file
     except Exception as e:
         logger.error(f"Error uploading to Drive: {e}")
         return None
 
-def get_mime_type(filename):
-    """Determine MIME type from filename"""
-    ext = filename.lower().split('.')[-1]
-    mime_types = {
-        'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-        'gif': 'image/gif', 'webp': 'image/webp',
-        'mp4': 'video/mp4', 'avi': 'video/x-msvideo', 'mkv': 'video/x-matroska',
-        'mov': 'video/quicktime', 'webm': 'video/webm',
-        'mp3': 'audio/mpeg', 'wav': 'audio/wav', 'ogg': 'audio/ogg',
-        'pdf': 'application/pdf', 'doc': 'application/msword',
-        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'xls': 'application/vnd.ms-excel',
-        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'zip': 'application/zip', 'rar': 'application/x-rar-compressed',
-        '7z': 'application/x-7z-compressed',
-        'txt': 'text/plain', 'csv': 'text/csv'
-    }
-    return mime_types.get(ext, 'application/octet-stream')
+# Initialize Pyrogram Client
+# We use "bot_session" for the session file name
+app = Client(
+    "bot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send welcome message"""
-    user_name = update.effective_user.first_name
-    await update.message.reply_text(
-        f"👋 Hi {user_name}! Welcome to *Google Drive Upload Bot*\n\n"
+@app.on_message(filters.command("start"))
+async def start(client, message):
+    user_name = message.from_user.first_name
+    await message.reply_text(
+        f"👋 Hi {user_name}! Welcome to *Google Drive Upload Bot* (Pyrogram Edition)\n\n"
         "📤 Send me any file and I'll upload it to your Google Drive!\n\n"
         "📊 *Limits:*\n"
-        "• Max file size: 2GB (Telegram limit)\n"
-        "• Supported: All file types\n\n"
-        "📁 Files are saved to your *TelegramUploads* folder\n\n"
-        "*Commands:*\n"
-        "/start - Show this message\n"
-        "/help - Get help\n"
-        "/stats - View upload statistics",
-        parse_mode='Markdown'
+        "• Max file size: 2GB (Standard) / 4GB (Premium)\n\n"
+        "📁 Files are saved to your configured Drive folder",
+        parse_mode=enums.ParseMode.MARKDOWN
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send help message"""
-    await update.message.reply_text(
-        "📚 *How to use:*\n\n"
-        "1️⃣ Send any file to this bot\n"
-        "2️⃣ Wait for download & upload confirmation\n"
-        "3️⃣ Click the link to view in Google Drive\n\n"
-        "💡 *Tips:*\n"
-        "• Larger files take longer to upload\n"
-        "• You'll get a direct link to each file\n"
-        "• All files are private in your Drive\n\n"
-        "❓ *Need help?* Contact the bot admin!",
-        parse_mode='Markdown'
-    )
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send statistics"""
+@app.on_message(filters.command("stats"))
+async def stats(client, message):
+    status_msg = await message.reply_text("🔄 Fetching stats...")
     try:
         service = get_drive_service()
         if not service:
-            await update.message.reply_text("❌ Could not connect to Google Drive")
+            await status_msg.edit_text("❌ Could not connect to Google Drive")
             return
         
         # Get files in folder
         results = service.files().list(
             q=f"'{DRIVE_FOLDER_ID}' in parents and trashed=false",
-            fields="files(name, size, createdTime)"
+            fields="files(name, size)"
         ).execute()
         
         files = results.get('files', [])
         total_files = len(files)
         total_size = sum(int(f.get('size', 0)) for f in files)
         
-        size_mb = total_size / (1024 * 1024)
-        size_gb = total_size / (1024 * 1024 * 1024)
+        size_gb = total_size / (1024 ** 3)
         
-        await update.message.reply_text(
+        await status_msg.edit_text(
             f"📊 *Upload Statistics*\n\n"
             f"📁 Total files: {total_files}\n"
-            f"💾 Total size: {size_gb:.2f} GB ({size_mb:.1f} MB)\n"
-            f"📂 Location: TelegramUploads folder",
-            parse_mode='Markdown'
+            f"💾 Total size: {size_gb:.2f} GB",
+            parse_mode=enums.ParseMode.MARKDOWN
         )
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
-        await update.message.reply_text("❌ Could not fetch statistics")
+        await status_msg.edit_text("❌ Could not fetch statistics")
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE, file_obj, file_name, file_type="file"):
-    """Generic file handler"""
+# Handle all media types: Documents, Photos, Videos, Audio, Voice
+@app.on_message(filters.media)
+async def handle_media(client, message):
+    # Determine file info based on media type
+    media = getattr(message, message.media.value)
+    
+    # Filename fallback
+    file_name = getattr(media, "file_name", None)
+    if not file_name:
+        # Generate generic name if none exists (e.g. for photos)
+        ext = ""
+        if message.photo: ext = ".jpg"
+        elif message.voice: ext = ".ogg"
+        elif message.video: ext = ".mp4"
+        elif message.audio: ext = ".mp3"
+        file_name = f"{message.media.value}_{message.id}{ext}"
+
+    file_size = getattr(media, "file_size", 0)
+    size_mb = file_size / (1024 * 1024)
+
+    # Progress callback function
+    async def progress(current, total):
+        # Update progress every 5MB or so to avoid flooding API
+        if (current // (1024 * 1024)) % 5 == 0 and current != total:
+             # You can add a visual progress bar here if you want, 
+             # but keeping it simple prevents "Message Not Modified" errors
+             pass
+
+    status_msg = await message.reply_text(
+        f"📥 *Downloading...*\n"
+        f"📄 Name: `{file_name}`\n"
+        f"📊 Size: {size_mb:.2f} MB",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+
+    local_path = f"downloads/{file_name}"
+    
     try:
-        file_size = file_obj.file_size if hasattr(file_obj, 'file_size') else 0
-        
-        # Check file size (2GB limit)
-        if file_size > 2147483648:
-            await update.message.reply_text(
-                "❌ *File too large!*\n\n"
-                "Maximum size: 2GB\n"
-                f"Your file: {file_size / (1024**3):.2f} GB",
-                parse_mode='Markdown'
-            )
-            return
-        
-        size_mb = file_size / (1024 * 1024)
-        
-        # Notify user
-        progress_msg = await update.message.reply_text(
-            f"📥 *Downloading {file_type}...*\n"
-            f"📄 Name: `{file_name}`\n"
-            f"📊 Size: {size_mb:.2f} MB",
-            parse_mode='Markdown'
+        # Pyrogram Download
+        download_path = await message.download(
+            file_name=local_path,
+            progress=progress
         )
         
-        # Download from Telegram
-        file = await context.bot.get_file(file_obj.file_id)
-        local_path = f"/tmp/{file_name}"
-        
-        try:
-            await file.download_to_drive(local_path)
-        except Exception as e:
-            await progress_msg.edit_text(
-                f"❌ *Download failed!*\n\n"
-                f"Error: {str(e)}",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # Update progress
-        await progress_msg.edit_text(
+        await status_msg.edit_text(
             f"☁️ *Uploading to Google Drive...*\n"
             f"📄 Name: `{file_name}`\n"
-            f"📊 Size: {size_mb:.2f} MB\n\n"
-            f"⏳ Please wait...",
-            parse_mode='Markdown'
+            f"⏳ Please wait..."
         )
-        
+
         # Upload to Drive
-        mime_type = get_mime_type(file_name)
-        result = upload_to_drive(local_path, file_name, mime_type)
+        # Note: We rely on Google Drive API to detect mime_type automatically 
+        # or defaults to application/octet-stream if we pass None, 
+        # but your previous code had a helper. We can simplify by letting Drive handle it 
+        # or use the mime_type from the message if available.
+        mime_type = getattr(media, "mime_type", "application/octet-stream")
         
-        # Clean up
-        if os.path.exists(local_path):
-            os.remove(local_path)
-        
+        # Run the blocking upload in a separate thread to not block the async loop
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, 
+            upload_to_drive, 
+            download_path, 
+            file_name, 
+            mime_type
+        )
+
         if result:
-            await progress_msg.edit_text(
+            await status_msg.edit_text(
                 f"✅ *Upload Successful!*\n\n"
                 f"📄 Name: `{file_name}`\n"
-                f"📊 Size: {size_mb:.2f} MB\n"
-                f"🔗 [View in Google Drive]({result.get('webViewLink')})\n\n"
-                f"_File saved to TelegramUploads folder_",
-                parse_mode='Markdown',
+                f"🔗 [View in Google Drive]({result.get('webViewLink')})",
+                parse_mode=enums.ParseMode.MARKDOWN,
                 disable_web_page_preview=True
             )
-            logger.info(f"Successfully uploaded {file_name} ({size_mb:.2f} MB)")
         else:
-            await progress_msg.edit_text(
-                "❌ *Upload failed!*\n\n"
-                "Please try again or check bot permissions.\n"
-                "Contact admin if the problem persists.",
-                parse_mode='Markdown'
-            )
-            
+            await status_msg.edit_text("❌ Upload failed check logs.")
+
     except Exception as e:
-        logger.error(f"Error handling {file_type}: {e}")
-        await update.message.reply_text(
-            f"❌ *Error occurred!*\n\n"
-            f"Type: {file_type}\n"
-            f"Error: {str(e)}\n\n"
-            "Please try again.",
-            parse_mode='Markdown'
-        )
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle document uploads"""
-    document = update.message.document
-    await handle_file(update, context, document, document.file_name, "document")
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photo uploads"""
-    photo = update.message.photo[-1]  # Highest quality
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"photo_{timestamp}_{photo.file_unique_id}.jpg"
-    await handle_file(update, context, photo, file_name, "photo")
-
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle video uploads"""
-    video = update.message.video
-    file_name = video.file_name or f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-    await handle_file(update, context, video, file_name, "video")
-
-async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle audio uploads"""
-    audio = update.message.audio
-    file_name = audio.file_name or f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3"
-    await handle_file(update, context, audio, file_name, "audio")
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle voice messages"""
-    voice = update.message.voice
-    file_name = f"voice_{datetime.now().strftime('%Y%m%d_%H%M%S')}.ogg"
-    await handle_file(update, context, voice, file_name, "voice message")
-
-def main():
-    """Start the bot"""
-    if not TELEGRAM_TOKEN:
-        logger.error("❌ TELEGRAM_TOKEN not set!")
-        return
+        logger.error(f"Error: {e}")
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
     
-    if not GOOGLE_CREDENTIALS:
-        logger.error("❌ GOOGLE_CREDENTIALS not set!")
-        return
-        
-    if not DRIVE_FOLDER_ID:
-        logger.error("❌ DRIVE_FOLDER_ID not set!")
-        return
-    
-    logger.info("🚀 Starting bot...")
-    
-    # Create application
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
-    application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    
-    # Run bot
-    logger.info("✅ Bot started successfully!")
-    logger.info("🤖 Waiting for messages...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        # Cleanup
+        if os.path.exists(local_path):
+            os.remove(local_path)
 
 if __name__ == '__main__':
-    main()
+    # Create downloads directory if not exists
+    if not os.path.exists("downloads"):
+        os.makedirs("downloads")
+    
+    print("🚀 Bot Started (Pyrogram)")
+    app.run()
